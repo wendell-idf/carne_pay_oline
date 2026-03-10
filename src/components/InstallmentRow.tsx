@@ -4,7 +4,7 @@ import { ChevronRight, Copy, Upload, CheckCircle2, AlertCircle } from 'lucide-re
 import { Installment } from '../types';
 import { differenceInDays, parse, isValid } from 'date-fns';
 
-export function InstallmentRow({ item, token, ...props }: { item: Installment, token: string, [key: string]: any }) {
+export function InstallmentRow({ item, token, totalInstallments, ...props }: { item: Installment, token: string, totalInstallments?: number, [key: string]: any }) {
   const [expanded, setExpanded] = useState(false);
 
   const copyPix = () => {
@@ -56,7 +56,7 @@ export function InstallmentRow({ item, token, ...props }: { item: Installment, t
           </div>
           <div>
             <p className="font-bold text-zinc-900 flex items-center gap-2">
-              Parcela {item.number}
+              Parcela {item.number}{totalInstallments ? ` de ${totalInstallments}` : ''}
               {overdueDays > 0 && (
                 <span className="flex items-center gap-1 text-xs font-bold text-red-600 bg-red-50 px-2 py-0.5 rounded-full">
                   <AlertCircle size={12} />

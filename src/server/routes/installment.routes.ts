@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { authenticate, authorize, AuthRequest } from '../middlewares/auth.middleware';
-import db from '../database';
+import sql from '../database';
 import multer from 'multer';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
@@ -17,20 +17,24 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 
 // Client: List My Installments
-router.get('/my-installments', authenticate, authorize(['client']), (req: AuthRequest, res) => {
-  const installments = db.prepare(`
-    SELECT i.*, ct.description as contract_description, ct.pix_key
-    FROM installments i
-    JOIN contracts ct ON i.contract_id = ct.id
-    JOIN clients c ON ct.client_id = c.id
-    WHERE c.user_id = ?
-    ORDER BY i.due_date ASC
-  `).all(req.user!.id);
-  res.json(installments);
+router.get('/my-installments', authenticate, authorize(['client']), async (req: AuthRequest, res) => {
+  try {
+    const installments = await sql`
+      SELECT i.*, ct.description as contract_description, ct.pix_key
+      FROM installments i
+      JOIN contracts ct ON i.contract_id = ct.id
+      JOIN clients c ON ct.client_id = c.id
+      WHERE c.user_id = ${req.user!.id}
+      ORDER BY i.due_date ASC
+    `;
+    res.json(installments);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Client: Upload Proof
-router.post('/:id/proof', authenticate, authorize(['client']), upload.single('proof'), (req: AuthRequest, res) => {
+router.post('/:id/proof', authenticate, authorize(['client']), upload.single('proof'), async (req: AuthRequest, res) => {
   const { id } = req.params;
   const proofUrl = req.file ? `/uploads/proofs/${req.file.filename}` : null;
 
@@ -38,16 +42,16 @@ router.post('/:id/proof', authenticate, authorize(['client']), upload.single('pr
 
   try {
     // Verify ownership
-    const installment = db.prepare(`
+    const installments = await sql`
       SELECT i.id FROM installments i
       JOIN contracts ct ON i.contract_id = ct.id
       JOIN clients c ON ct.client_id = c.id
-      WHERE i.id = ? AND c.user_id = ?
-    `).get(id, req.user!.id);
+      WHERE i.id = ${id} AND c.user_id = ${req.user!.id}
+    `;
 
-    if (!installment) return res.status(403).json({ error: 'Unauthorized' });
+    if (installments.length === 0) return res.status(403).json({ error: 'Unauthorized' });
 
-    db.prepare('UPDATE installments SET proof_url = ? WHERE id = ?').run(proofUrl, id);
+    await sql`UPDATE installments SET proof_url = ${proofUrl} WHERE id = ${id}`;
     res.json({ message: 'Proof uploaded successfully', proofUrl });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -55,28 +59,30 @@ router.post('/:id/proof', authenticate, authorize(['client']), upload.single('pr
 });
 
 // Admin: Mark as Paid
-router.post('/:id/pay', authenticate, authorize(['admin']), (req, res) => {
+router.post('/:id/pay', authenticate, authorize(['admin']), async (req, res) => {
   const { id } = req.params;
   const { paidValue, paymentDate, notes } = req.body;
 
   try {
-    const transaction = db.transaction(() => {
-      db.prepare(`
+    await sql.begin(async (tx: any) => {
+      await tx`
         UPDATE installments 
-        SET status = 'paid', paid_value = ?, payment_date = ?, notes = ?
-        WHERE id = ?
-      `).run(paidValue, paymentDate || new Date().toISOString(), notes, id);
+        SET status = 'paid', paid_value = ${paidValue}, payment_date = ${paymentDate || new Date().toISOString()}, notes = ${notes}
+        WHERE id = ${id}
+      `;
 
       // Check if contract is fully paid
-      const installment = db.prepare('SELECT contract_id FROM installments WHERE id = ?').get(id) as any;
-      const pendingCount = db.prepare("SELECT COUNT(*) as count FROM installments WHERE contract_id = ? AND status != 'paid'").get(installment.contract_id) as any;
+      const installments = await tx`SELECT contract_id FROM installments WHERE id = ${id}`;
+      const installment = installments[0];
+      
+      const pendingCounts = await tx`SELECT COUNT(*) as count FROM installments WHERE contract_id = ${installment.contract_id} AND status != 'paid'`;
+      const pendingCount = Number(pendingCounts[0].count);
 
-      if (pendingCount.count === 0) {
-        db.prepare("UPDATE contracts SET status = 'paid' WHERE id = ?").run(installment.contract_id);
+      if (pendingCount === 0) {
+        await tx`UPDATE contracts SET status = 'paid' WHERE id = ${installment.contract_id}`;
       }
     });
 
-    transaction();
     res.json({ message: 'Installment marked as paid' });
   } catch (error: any) {
     res.status(500).json({ error: error.message });

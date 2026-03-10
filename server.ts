@@ -1,9 +1,9 @@
+import 'dotenv/config';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import dotenv from 'dotenv';
 
 // Routes
 import authRoutes from './src/server/routes/auth.routes';
@@ -11,8 +11,6 @@ import clientRoutes from './src/server/routes/client.routes';
 import contractRoutes from './src/server/routes/contract.routes';
 import installmentRoutes from './src/server/routes/installment.routes';
 import adminRoutes from './src/server/routes/admin.routes';
-
-dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

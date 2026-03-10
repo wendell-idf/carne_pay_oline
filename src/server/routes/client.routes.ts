@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { authenticate, authorize, AuthRequest } from '../middlewares/auth.middleware';
-import db from '../database';
+import sql from '../database';
 import { v4 as uuidv4 } from 'uuid';
 import bcrypt from 'bcryptjs';
 import { addMonths, format, parseISO } from 'date-fns';
@@ -8,7 +8,7 @@ import { addMonths, format, parseISO } from 'date-fns';
 const router = Router();
 
 // Admin: Register Client
-router.post('/', authenticate, authorize(['admin']), (req: AuthRequest, res) => {
+router.post('/', authenticate, authorize(['admin']), async (req: AuthRequest, res) => {
   const { name, email, password, cpf, phone, address } = req.body;
 
   try {
@@ -16,18 +16,21 @@ router.post('/', authenticate, authorize(['admin']), (req: AuthRequest, res) => 
     const clientId = uuidv4();
     const hashedPassword = bcrypt.hashSync(password || 'cliente123', 10);
 
-    const transaction = db.transaction(() => {
-      db.prepare('INSERT INTO users (id, name, email, password, role) VALUES (?, ?, ?, ?, ?)')
-        .run(userId, name, email, hashedPassword, 'client');
+    await sql.begin(async (tx: any) => {
+      await tx`
+        INSERT INTO users (id, name, email, password, role) 
+        VALUES (${userId}, ${name}, ${email}, ${hashedPassword}, 'client')
+      `;
       
-      db.prepare('INSERT INTO clients (id, user_id, cpf, phone, address) VALUES (?, ?, ?, ?, ?)')
-        .run(clientId, userId, cpf, phone, address);
+      await tx`
+        INSERT INTO clients (id, user_id, cpf, phone, address) 
+        VALUES (${clientId}, ${userId}, ${cpf}, ${phone}, ${address})
+      `;
     });
 
-    transaction();
     res.status(201).json({ id: clientId, message: 'Client registered successfully' });
   } catch (error: any) {
-    if (error.message.includes('UNIQUE')) {
+    if (error.message.includes('UNIQUE') || error.message.includes('unique constraint')) {
       return res.status(400).json({ error: 'Email or CPF already exists' });
     }
     res.status(500).json({ error: error.message });
@@ -35,7 +38,7 @@ router.post('/', authenticate, authorize(['admin']), (req: AuthRequest, res) => 
 });
 
 // Admin: Update Client and Contract
-router.put('/:id', authenticate, authorize(['admin']), (req: AuthRequest, res) => {
+router.put('/:id', authenticate, authorize(['admin']), async (req: AuthRequest, res) => {
   const { id } = req.params;
   const { 
     name, email, password, cpf, phone, address,
@@ -43,42 +46,43 @@ router.put('/:id', authenticate, authorize(['admin']), (req: AuthRequest, res) =
   } = req.body;
 
   try {
-    const client = db.prepare('SELECT user_id FROM clients WHERE id = ?').get(id) as any;
+    const clients = await sql`SELECT user_id FROM clients WHERE id = ${id}`;
+    const client = clients[0];
     if (!client) return res.status(404).json({ error: 'Client not found' });
 
-    const transaction = db.transaction(() => {
+    await sql.begin(async (tx: any) => {
       // Update User
       if (password) {
         const hashedPassword = bcrypt.hashSync(password, 10);
-        db.prepare('UPDATE users SET name = ?, email = ?, password = ? WHERE id = ?')
-          .run(name, email, hashedPassword, client.user_id);
+        await tx`UPDATE users SET name = ${name}, email = ${email}, password = ${hashedPassword} WHERE id = ${client.user_id}`;
       } else {
-        db.prepare('UPDATE users SET name = ?, email = ? WHERE id = ?')
-          .run(name, email, client.user_id);
+        await tx`UPDATE users SET name = ${name}, email = ${email} WHERE id = ${client.user_id}`;
       }
 
       // Update Client
-      db.prepare('UPDATE clients SET cpf = ?, phone = ?, address = ? WHERE id = ?')
-        .run(cpf, phone, address, id);
+      await tx`UPDATE clients SET cpf = ${cpf}, phone = ${phone}, address = ${address} WHERE id = ${id}`;
 
       // Handle Contract if provided
       if (totalValue && installmentsCount && installmentValue && firstInstallmentDate) {
-        const existingContract = db.prepare('SELECT id FROM contracts WHERE client_id = ? LIMIT 1').get(id) as any;
+        const existingContracts = await tx`SELECT id FROM contracts WHERE client_id = ${id} LIMIT 1`;
+        const existingContract = existingContracts[0];
         
         if (existingContract) {
           // Update existing contract
-          db.prepare(`
+          await tx`
             UPDATE contracts SET 
-              total_value = ?, installments_count = ?, installment_value = ?, first_installment_date = ?, pix_key = ?
-            WHERE id = ?
-          `).run(totalValue, installmentsCount, installmentValue, firstInstallmentDate, pixKey || '62991374935', existingContract.id);
+              total_value = ${totalValue}, installments_count = ${installmentsCount}, 
+              installment_value = ${installmentValue}, first_installment_date = ${firstInstallmentDate}, 
+              pix_key = ${pixKey || '62991374935'}
+            WHERE id = ${existingContract.id}
+          `;
 
           // Delete existing pending installments
-          db.prepare("DELETE FROM installments WHERE contract_id = ? AND status = 'pending'").run(existingContract.id);
+          await tx`DELETE FROM installments WHERE contract_id = ${existingContract.id} AND status = 'pending'`;
 
           // Calculate remaining installments
-          const paidInstallments = db.prepare("SELECT COUNT(*) as count FROM installments WHERE contract_id = ? AND status = 'paid'").get(existingContract.id) as any;
-          const paidCount = paidInstallments.count;
+          const paidInstallments = await tx`SELECT COUNT(*) as count FROM installments WHERE contract_id = ${existingContract.id} AND status = 'paid'`;
+          const paidCount = Number(paidInstallments[0].count);
 
           const remainingCount = installmentsCount - paidCount;
           if (remainingCount > 0) {
@@ -86,43 +90,42 @@ router.put('/:id', authenticate, authorize(['admin']), (req: AuthRequest, res) =
             for (let i = 1; i <= remainingCount; i++) {
               const installmentNumber = paidCount + i;
               const dueDate = addMonths(startDate, installmentNumber - 1);
-              db.prepare(`
+              await tx`
                 INSERT INTO installments (id, contract_id, number, value, due_date)
-                VALUES (?, ?, ?, ?, ?)
-              `).run(uuidv4(), existingContract.id, installmentNumber, installmentValue, format(dueDate, 'yyyy-MM-dd'));
+                VALUES (${uuidv4()}, ${existingContract.id}, ${installmentNumber}, ${installmentValue}, ${format(dueDate, 'yyyy-MM-dd')})
+              `;
             }
           }
         } else {
           // Create new contract
           const contractId = uuidv4();
-          db.prepare(`
+          await tx`
             INSERT INTO contracts (
               id, client_id, description, total_value, down_payment, 
               installments_count, installment_value, first_installment_date, 
               due_day, pix_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `).run(
-            contractId, id, 'Contrato Padrão', totalValue, 0, 
-            installmentsCount, installmentValue, firstInstallmentDate, 
-            15, pixKey || '62991374935'
-          );
+            ) VALUES (
+              ${contractId}, ${id}, 'Contrato Padrão', ${totalValue}, 0, 
+              ${installmentsCount}, ${installmentValue}, ${firstInstallmentDate}, 
+              15, ${pixKey || '62991374935'}
+            )
+          `;
 
           const startDate = parseISO(firstInstallmentDate);
           for (let i = 1; i <= installmentsCount; i++) {
             const dueDate = addMonths(startDate, i - 1);
-            db.prepare(`
+            await tx`
               INSERT INTO installments (id, contract_id, number, value, due_date)
-              VALUES (?, ?, ?, ?, ?)
-            `).run(uuidv4(), contractId, i, installmentValue, format(dueDate, 'yyyy-MM-dd'));
+              VALUES (${uuidv4()}, ${contractId}, ${i}, ${installmentValue}, ${format(dueDate, 'yyyy-MM-dd')})
+            `;
           }
         }
       }
     });
 
-    transaction();
     res.json({ message: 'Client updated successfully' });
   } catch (error: any) {
-    if (error.message.includes('UNIQUE')) {
+    if (error.message.includes('UNIQUE') || error.message.includes('unique constraint')) {
       return res.status(400).json({ error: 'Email or CPF already exists' });
     }
     res.status(500).json({ error: error.message });
@@ -130,30 +133,39 @@ router.put('/:id', authenticate, authorize(['admin']), (req: AuthRequest, res) =
 });
 
 // Admin: List Clients
-router.get('/', authenticate, authorize(['admin']), (req, res) => {
-  const clients = db.prepare(`
-    SELECT c.*, u.name, u.email, u.created_at,
-           ct.total_value, ct.installments_count, ct.installment_value, ct.first_installment_date
-    FROM clients c 
-    JOIN users u ON c.user_id = u.id
-    LEFT JOIN contracts ct ON ct.client_id = c.id
-  `).all();
-  res.json(clients);
+router.get('/', authenticate, authorize(['admin']), async (req, res) => {
+  try {
+    const clients = await sql`
+      SELECT c.*, u.name, u.email, u.created_at,
+             ct.total_value, ct.installments_count, ct.installment_value, ct.first_installment_date
+      FROM clients c 
+      JOIN users u ON c.user_id = u.id
+      LEFT JOIN contracts ct ON ct.client_id = c.id
+    `;
+    res.json(clients);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Admin: Get Client Details
-router.get('/:id', authenticate, authorize(['admin']), (req, res) => {
-  const client = db.prepare(`
-    SELECT c.*, u.name, u.email, u.created_at,
-           ct.total_value, ct.installments_count, ct.installment_value, ct.first_installment_date
-    FROM clients c 
-    JOIN users u ON c.user_id = u.id
-    LEFT JOIN contracts ct ON ct.client_id = c.id
-    WHERE c.id = ?
-  `).get(req.params.id);
+router.get('/:id', authenticate, authorize(['admin']), async (req, res) => {
+  try {
+    const clients = await sql`
+      SELECT c.*, u.name, u.email, u.created_at,
+             ct.total_value, ct.installments_count, ct.installment_value, ct.first_installment_date
+      FROM clients c 
+      JOIN users u ON c.user_id = u.id
+      LEFT JOIN contracts ct ON ct.client_id = c.id
+      WHERE c.id = ${req.params.id}
+    `;
 
-  if (!client) return res.status(404).json({ error: 'Client not found' });
-  res.json(client);
+    const client = clients[0];
+    if (!client) return res.status(404).json({ error: 'Client not found' });
+    res.json(client);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 export default router;

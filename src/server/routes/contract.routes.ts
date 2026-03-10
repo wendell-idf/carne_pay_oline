@@ -1,13 +1,13 @@
 import { Router } from 'express';
 import { authenticate, authorize, AuthRequest } from '../middlewares/auth.middleware';
-import db from '../database';
+import sql from '../database';
 import { v4 as uuidv4 } from 'uuid';
 import { addMonths, format, parseISO } from 'date-fns';
 
 const router = Router();
 
 // Admin: Create Contract
-router.post('/', authenticate, authorize(['admin']), (req, res) => {
+router.post('/', authenticate, authorize(['admin']), async (req, res) => {
   const { 
     clientId, description, totalValue, downPayment, 
     installmentsCount, installmentValue, firstInstallmentDate, 
@@ -17,33 +17,32 @@ router.post('/', authenticate, authorize(['admin']), (req, res) => {
   try {
     const contractId = uuidv4();
     
-    const transaction = db.transaction(() => {
+    await sql.begin(async (tx: any) => {
       // Insert Contract
-      db.prepare(`
+      await tx`
         INSERT INTO contracts (
           id, client_id, description, total_value, down_payment, 
           installments_count, installment_value, first_installment_date, 
           due_day, pix_key
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        contractId, clientId, description, totalValue, downPayment, 
-        installmentsCount, installmentValue, firstInstallmentDate, 
-        dueDay, pixKey || '62991374935'
-      );
+        ) VALUES (
+          ${contractId}, ${clientId}, ${description}, ${totalValue}, ${downPayment}, 
+          ${installmentsCount}, ${installmentValue}, ${firstInstallmentDate}, 
+          ${dueDay}, ${pixKey || '62991374935'}
+        )
+      `;
 
       // Generate Installments
       const startDate = parseISO(firstInstallmentDate);
       for (let i = 1; i <= installmentsCount; i++) {
         const dueDate = addMonths(startDate, i - 1);
         // Adjust to dueDay if needed, but here we use the firstInstallmentDate as base
-        db.prepare(`
+        await tx`
           INSERT INTO installments (id, contract_id, number, value, due_date)
-          VALUES (?, ?, ?, ?, ?)
-        `).run(uuidv4(), contractId, i, installmentValue, format(dueDate, 'yyyy-MM-dd'));
+          VALUES (${uuidv4()}, ${contractId}, ${i}, ${installmentValue}, ${format(dueDate, 'yyyy-MM-dd')})
+        `;
       }
     });
 
-    transaction();
     res.status(201).json({ id: contractId, message: 'Contract and installments created' });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -51,7 +50,7 @@ router.post('/', authenticate, authorize(['admin']), (req, res) => {
 });
 
 // Admin: Update Contract
-router.put('/:id', authenticate, authorize(['admin']), (req, res) => {
+router.put('/:id', authenticate, authorize(['admin']), async (req, res) => {
   const { id } = req.params;
   const { 
     clientId, description, totalValue, downPayment, 
@@ -60,26 +59,22 @@ router.put('/:id', authenticate, authorize(['admin']), (req, res) => {
   } = req.body;
 
   try {
-    const transaction = db.transaction(() => {
+    await sql.begin(async (tx: any) => {
       // Update Contract
-      db.prepare(`
+      await tx`
         UPDATE contracts SET 
-          client_id = ?, description = ?, total_value = ?, down_payment = ?, 
-          installments_count = ?, installment_value = ?, first_installment_date = ?, 
-          due_day = ?, pix_key = ?
-        WHERE id = ?
-      `).run(
-        clientId, description, totalValue, downPayment, 
-        installmentsCount, installmentValue, firstInstallmentDate, 
-        dueDay, pixKey || '62991374935', id
-      );
+          client_id = ${clientId}, description = ${description}, total_value = ${totalValue}, down_payment = ${downPayment}, 
+          installments_count = ${installmentsCount}, installment_value = ${installmentValue}, first_installment_date = ${firstInstallmentDate}, 
+          due_day = ${dueDay}, pix_key = ${pixKey || '62991374935'}
+        WHERE id = ${id}
+      `;
 
       // Delete existing pending installments
-      db.prepare("DELETE FROM installments WHERE contract_id = ? AND status = 'pending'").run(id);
+      await tx`DELETE FROM installments WHERE contract_id = ${id} AND status = 'pending'`;
 
       // We need to figure out how many installments are already paid
-      const paidInstallments = db.prepare("SELECT COUNT(*) as count FROM installments WHERE contract_id = ? AND status = 'paid'").get(id) as any;
-      const paidCount = paidInstallments.count;
+      const paidInstallments = await tx`SELECT COUNT(*) as count FROM installments WHERE contract_id = ${id} AND status = 'paid'`;
+      const paidCount = Number(paidInstallments[0].count);
 
       // Generate new pending installments for the remaining count
       const remainingCount = installmentsCount - paidCount;
@@ -88,15 +83,14 @@ router.put('/:id', authenticate, authorize(['admin']), (req, res) => {
         for (let i = 1; i <= remainingCount; i++) {
           const installmentNumber = paidCount + i;
           const dueDate = addMonths(startDate, installmentNumber - 1);
-          db.prepare(`
+          await tx`
             INSERT INTO installments (id, contract_id, number, value, due_date)
-            VALUES (?, ?, ?, ?, ?)
-          `).run(uuidv4(), id, installmentNumber, installmentValue, format(dueDate, 'yyyy-MM-dd'));
+            VALUES (${uuidv4()}, ${id}, ${installmentNumber}, ${installmentValue}, ${format(dueDate, 'yyyy-MM-dd')})
+          `;
         }
       }
     });
 
-    transaction();
     res.json({ message: 'Contract updated successfully' });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -104,10 +98,10 @@ router.put('/:id', authenticate, authorize(['admin']), (req, res) => {
 });
 
 // Admin: Delete Contract
-router.delete('/:id', authenticate, authorize(['admin']), (req, res) => {
+router.delete('/:id', authenticate, authorize(['admin']), async (req, res) => {
   const { id } = req.params;
   try {
-    db.prepare('DELETE FROM contracts WHERE id = ?').run(id);
+    await sql`DELETE FROM contracts WHERE id = ${id}`;
     res.json({ message: 'Contract deleted successfully' });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -115,25 +109,33 @@ router.delete('/:id', authenticate, authorize(['admin']), (req, res) => {
 });
 
 // Admin: List Contracts
-router.get('/', authenticate, authorize(['admin']), (req, res) => {
-  const contracts = db.prepare(`
-    SELECT ct.*, u.name as client_name 
-    FROM contracts ct
-    JOIN clients c ON ct.client_id = c.id
-    JOIN users u ON c.user_id = u.id
-  `).all();
-  res.json(contracts);
+router.get('/', authenticate, authorize(['admin']), async (req, res) => {
+  try {
+    const contracts = await sql`
+      SELECT ct.*, u.name as client_name 
+      FROM contracts ct
+      JOIN clients c ON ct.client_id = c.id
+      JOIN users u ON c.user_id = u.id
+    `;
+    res.json(contracts);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Client: Get My Contracts
-router.get('/my-contracts', authenticate, authorize(['client']), (req: AuthRequest, res) => {
-  const contracts = db.prepare(`
-    SELECT ct.* 
-    FROM contracts ct
-    JOIN clients c ON ct.client_id = c.id
-    WHERE c.user_id = ?
-  `).all(req.user!.id);
-  res.json(contracts);
+router.get('/my-contracts', authenticate, authorize(['client']), async (req: AuthRequest, res) => {
+  try {
+    const contracts = await sql`
+      SELECT ct.* 
+      FROM contracts ct
+      JOIN clients c ON ct.client_id = c.id
+      WHERE c.user_id = ${req.user!.id}
+    `;
+    res.json(contracts);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 export default router;

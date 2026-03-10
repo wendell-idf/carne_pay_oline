@@ -151,7 +151,7 @@ export function ClientCarnet({ token, ...props }: { token: string, [key: string]
 
         <div className="space-y-3">
           {filteredInstallments.map((item) => (
-            <InstallmentRow key={item.id} item={item} token={token} />
+            <InstallmentRow key={item.id} item={item} token={token} totalInstallments={contract?.installments_count || installments.length} />
           ))}
           {filteredInstallments.length === 0 && (
             <div className="text-center py-8 text-zinc-500 bg-white rounded-2xl border border-zinc-200">
